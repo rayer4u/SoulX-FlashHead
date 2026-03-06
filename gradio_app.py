@@ -6,6 +6,7 @@ import time
 import imageio
 import librosa
 import subprocess
+import soundfile as sf
 from datetime import datetime
 from collections import deque
 from loguru import logger
@@ -144,6 +145,44 @@ def save_video_to_file(frames_list, video_path, audio_path, fps):
     
     return video_path
 
+def save_video_fragment(frames_list, output_path, fps, audio_path=None):
+    """【纯净 TS 生成器】：确保输出的 TS 切片时间戳永远是从 0.0000 严格开始"""
+    if not output_path.endswith('.ts'):
+        output_path = output_path.rsplit('.', 1)[0] + '.ts'
+
+    temp_video_path = output_path.replace('.ts', '_temp.mp4')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    try:
+        # 强制指定浏览器唯一支持的 yuv420p
+        with imageio.get_writer(temp_video_path, format='mp4', mode='I',
+                                fps=fps, codec='h264') as writer:
+            for frames in frames_list:
+                frames = frames.numpy().astype(np.uint8)
+                for i in range(frames.shape[0]):
+                    writer.append_data(frames[i, :, :, :])
+
+        if audio_path:
+            # 引入魔法参数：-avoid_negative_ts make_zero，强制打平时间戳！
+            final_cmd = [
+                'ffmpeg', '-y', '-i', temp_video_path, '-i', audio_path,
+                '-c:v', 'copy', '-c:a', 'aac', '-ar', '44100',
+                '-avoid_negative_ts', 'make_zero', '-f', 'mpegts', output_path
+            ]
+            subprocess.run(final_cmd, check=True, capture_output=True)
+        else:
+            final_cmd = [
+                'ffmpeg', '-y', '-i', temp_video_path, '-c', 'copy',
+                '-avoid_negative_ts', 'make_zero', '-f', 'mpegts', output_path
+            ]
+            subprocess.run(final_cmd, check=True, capture_output=True)
+
+        return output_path
+    finally:
+        if os.path.exists(temp_video_path): os.remove(temp_video_path)
+        if audio_path and os.path.exists(audio_path): os.remove(audio_path) # 清理临时 wav
+
+
 def run_inference(
     ckpt_dir,
     wav2vec_dir,
@@ -192,7 +231,7 @@ def run_inference(
     frame_num = infer_params['frame_num']
     motion_frames_num = infer_params['motion_frames_num']
     slice_len = frame_num - motion_frames_num
-
+    
     generated_list = []
 
     # Load Audio
@@ -205,6 +244,10 @@ def run_inference(
     human_speech_array_frame_num = frame_num * sample_rate // tgt_fps
 
     logger.info("Data preparation done. Start to generate video...")
+    output_dir = 'gradio_results'
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    base_filename = f"res_{timestamp}"
 
     # 3. Generation Loop
     if audio_encode_mode == 'once':
@@ -236,7 +279,20 @@ def run_inference(
             
             generated_list.append(video.cpu())
 
+        # 4. Save Video
+        progress(0.95, desc="Saving Video...")
+
+        final_save_path = os.path.join(output_dir, f"{base_filename}.mp4")
+        final_video_path = save_video_to_file(generated_list, final_save_path, audio_path, fps=tgt_fps)
+        logger.info(f"Saved final video to {final_video_path}")
+
     elif audio_encode_mode == 'stream':
+        chunk_duration = frame_num / tgt_fps
+        stream_duration = 3.0  # 
+        dynamic_stream_interval = max(1, int(stream_duration / chunk_duration))
+        stream_chunk_list = []
+        current_audio_sample_idx = 0
+
         cached_audio_length_sum = sample_rate * cached_audio_duration
         audio_end_idx = cached_audio_duration * tgt_fps
         audio_start_idx = audio_end_idx - frame_num
@@ -246,49 +302,45 @@ def run_inference(
         # pad audio with silence to avoid truncating the last chunk
         remainder = len(human_speech_array_all) % human_speech_array_slice_len
         if remainder > 0:
-            pad_length = human_speech_array_slice_len - remainder
-            human_speech_array_all = np.concatenate([human_speech_array_all, np.zeros(pad_length, dtype=human_speech_array_all.dtype)])
+            human_speech_array_all = np.concatenate([human_speech_array_all, np.zeros(human_speech_array_slice_len - remainder, dtype=human_speech_array_all.dtype)])
 
-        # split audio embedding into chunks: 28, 28, 28, 28, ...
         human_speech_array_slices = human_speech_array_all.reshape(-1, human_speech_array_slice_len)
 
-        total_chunks = len(human_speech_array_slices)
         for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
-            progress(0.2 + 0.7 * (chunk_idx / total_chunks), desc=f"Generating chunk {chunk_idx+1}/{total_chunks}")
-            
-            # streaming encode audio chunks
             audio_dq.extend(human_speech_array.tolist())
             audio_array = np.array(audio_dq)
             audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
 
-            torch.cuda.synchronize()
-            start_time = time.time()
-
-            # inference
             video = run_pipeline(pipeline, audio_embedding)
             video = video[motion_frames_num:]
 
-            torch.cuda.synchronize()
-            end_time = time.time()
-            logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s")
-
             generated_list.append(video.cpu())
+            stream_chunk_list.append(video.cpu())
 
-    # 4. Save Video
-    progress(0.95, desc="Saving Video...")
-    output_dir = 'gradio_results'
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-    filename = f"res_{timestamp}.mp4"
-    save_path = os.path.join(output_dir, filename)
-    
-    final_video_path = save_video_to_file(generated_list, save_path, audio_path, fps=tgt_fps)
-    logger.info(f"Saved to {final_video_path}")
-    
-    return final_video_path
+            if (chunk_idx + 1) % dynamic_stream_interval == 0:
+                fragment_path = os.path.join(output_dir, f"{base_filename}_part{chunk_idx+1}.ts")
 
-# Gradio Interface Definition
+                frames_in_fragment = sum(v.shape[0] for v in stream_chunk_list)
+                samples_in_fragment = int(frames_in_fragment * sample_rate / tgt_fps)
+
+                audio_fragment = human_speech_array_all[current_audio_sample_idx : current_audio_sample_idx + samples_in_fragment]
+                current_audio_sample_idx += samples_in_fragment
+
+                temp_audio_path = os.path.join(output_dir, f"temp_audio_{chunk_idx}.wav")
+                sf.write(temp_audio_path, audio_fragment, sample_rate)
+
+                save_video_fragment(stream_chunk_list, fragment_path, fps=tgt_fps, audio_path=temp_audio_path)
+                logger.info(f"Streamed fragment to {fragment_path}")
+                yield fragment_path, gr.update(visible=False)
+                stream_chunk_list = []
+
+        final_save_path = os.path.join(output_dir, f"{base_filename}.mp4")
+        final_video_path = save_video_to_file(generated_list, final_save_path, audio_path, fps=tgt_fps)
+        logger.info(f"Saved final video to {final_video_path}")
+
+        yield gr.update(), gr.update(value=final_video_path, visible=True)
+
+
 with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) as app:
     gr.Markdown("# ⚡ SoulX-FlashHead Video Generator")
     gr.Markdown("Upload an image and an audio file to generate a talking head video.")
@@ -324,7 +376,7 @@ with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) 
                                 ("Pro Version (Multi-GPU Support)", "pro"),
                                 ("Lite Version (Single GPU Only)", "lite")
                             ],
-                            value="pro",
+                            value="lite",
                             info="Select the model variant. 'pro' supports both single and multi-GPU, 'lite' is single GPU only."
                         )
                         mode_input = gr.Radio(
@@ -373,7 +425,17 @@ with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) 
 
         with gr.Column(scale=1):
             gr.Markdown("### 📺 Output Video")
-            video_output = gr.Video(label="Generated Video", height=500)
+            # 开启 Gradio 5 原生的 TS 联播引擎
+            video_output = gr.Video(
+                label="Generated Video", 
+                height=500,
+                autoplay=True,
+                streaming=True,  
+            )
+            download_output = gr.File(
+                label="📥 Download High-Quality Complete Video", 
+                visible=False
+            )
 
     # Event Handlers
     def update_visibility(model_type, mode):
@@ -401,11 +463,15 @@ with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) 
         mode, gpu_ids, ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop
     ):
         if mode == "Single GPU":
-            return run_inference(ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop)
+            if enc_mode == "stream":
+                yield from run_inference(
+                    ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop,
+                )
+            else:
+                return run_inference(ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop)
         else:
             return run_multi_gpu_inference(gpu_ids, ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop)
 
-    # Event Binding
     generate_btn.click(
         fn=dispatch_inference,
         inputs=[
@@ -420,8 +486,13 @@ with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) 
             seed_input,
             use_face_crop_input
         ],
-        outputs=video_output
-    ) 
+        outputs=[video_output, download_output],
+        queue=True
+    )
 
 if __name__ == "__main__":
-    app.launch()
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+    )
