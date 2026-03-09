@@ -123,6 +123,17 @@ bash inference_script_single_gpu_lite.sh
 # Real-time inference speed can be supported on single RTX-4090 (up to 3 concurrent).
 ```
 
+### ⚡️ Gradio Demo
+```bash
+# Gradio support needs gradio==5.50.0, and Chrome recommonded.
+
+# common gradio demo
+python gradio_app.py
+
+# streaming gradio demo (Only support single GPU)
+python gradio_app_streaming.py
+```
+
 ### 👋 Online Experience 
 For a real-time interactive experience, scan the QR code to enter the event link. [2026.2.12~2026.3.11]
 <a id="online-experience-qr"></a>

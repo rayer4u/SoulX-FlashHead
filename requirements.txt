@@ -16,7 +16,7 @@ ftfy
 imageio-ffmpeg
 scikit-image
 loguru
-gradio>=5.0.0
+gradio==5.50.0
 xfuser>=0.4.3
 pyloudnorm
 decord
