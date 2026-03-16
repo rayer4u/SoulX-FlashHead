@@ -5,6 +5,7 @@ import numpy as np
 import threading
 import time
 import librosa
+import queue
 import subprocess
 from datetime import datetime
 from collections import deque
@@ -18,6 +19,9 @@ pipeline = None
 loaded_ckpt_dir = None
 loaded_wav2vec_dir = None
 loaded_model_type = None
+live_audio_queue = queue.Queue()
+global_sample_rate = 16000
+global_slice_len_samples = None 
 
 class LiveFFmpegPipeline:
     """工业级 FFmpeg 管道推流器：常驻内存，吃裸数据，吐标准直播流"""
@@ -31,13 +35,11 @@ class LiveFFmpegPipeline:
         os.makedirs(output_dir, exist_ok=True)
         self.playlist_path = os.path.join(output_dir, "playlist.m3u8")
         
-        # 1. 创建音频专用命名管道 (FIFO)
         self.audio_fifo = os.path.join(output_dir, "audio_pipe.fifo")
         if os.path.exists(self.audio_fifo):
             os.remove(self.audio_fifo)
         os.mkfifo(self.audio_fifo)
         
-        # 2. 组装 FFmpeg 常驻命令
         ffmpeg_cmd = [
             'ffmpeg', '-y',
             # -- 视频输入流 (来自 stdin, 接收 Raw RGB24 字节流) --
@@ -74,7 +76,7 @@ class LiveFFmpegPipeline:
             # -- HLS 直播滑动窗口配置 --
             '-f', 'hls',
             '-hls_time', '1.92',      # 切片长度 (48帧完美对齐)
-            '-hls_list_size', '20',    # 滑动窗口只保留最新的 5 个切片
+            '-hls_list_size', '20',    # 滑动窗口只保留最新的 20 个切片
             '-hls_flags', 'delete_segments', # 自动删除旧切片，防止硬盘爆炸
             '-hls_segment_filename', os.path.join(output_dir, 'chunk_%04d.ts'),
             self.playlist_path
@@ -90,7 +92,6 @@ class LiveFFmpegPipeline:
         logger.info("Pipeline is ready and listening for data.")
 
     def push_data(self, video_frames_np, audio_data_np):
-        """双线程实时推流：完美破解 FFmpeg 缓冲区死锁"""
         try:
             # 先把矩阵转成字节流
             video_bytes = video_frames_np.tobytes()
@@ -127,7 +128,6 @@ class LiveFFmpegPipeline:
             logger.error(f"Pipeline push_data error: {e}")
 
     def close(self):
-        """优雅下播：切断数据源 -> 等待残余切片生成 -> 清扫战场"""
         logger.info("Initiating pipeline shutdown...")
         
         # 1. 【极度关键】：必须先同时关闭视频和音频的输入！
@@ -166,6 +166,44 @@ class LiveFFmpegPipeline:
         logger.info("Pipeline closed cleanly. Ready for next stream.")
 
 
+def insert_dynamic_audio(new_audio_path):
+    """动态插播音频处理函数"""
+    global global_sample_rate, global_slice_len_samples
+    
+    if new_audio_path is None:
+        gr.Warning("请先上传音频文件！")
+        return "⚠️ 未检测到音频。"
+        
+    if global_slice_len_samples is None:
+        gr.Warning("直播尚未开始，请先启动 Start Live Stream！")
+        return "⚠️ 直播未启动，插播失败。"
+
+    try:
+        # 加载新音频
+        new_audio_array, _ = librosa.load(new_audio_path, sr=global_sample_rate, mono=True)
+        
+        # 补齐末尾，防止切片报错
+        remainder = len(new_audio_array) % global_slice_len_samples
+        if remainder > 0:
+            new_audio_array = np.concatenate([
+                new_audio_array, 
+                np.zeros(global_slice_len_samples - remainder, dtype=new_audio_array.dtype)
+            ])
+            
+        # 切片并送入队列
+        slices = new_audio_array.reshape(-1, global_slice_len_samples)
+        for s in slices:
+            live_audio_queue.put(s)
+            
+        logger.info(f"Successfully inserted {len(slices)} chunks of new audio into the stream!")
+        gr.Info("插播成功！数字人即将开始播报。")
+        return f"✅ 成功插入 {len(slices)} 个音频切片，正在排队播放..."
+        
+    except Exception as e:
+        logger.error(f"Insert audio failed: {e}")
+        return f"❌ 插播失败: {str(e)}"
+
+
 def run_inference(
     ckpt_dir,
     wav2vec_dir,
@@ -177,6 +215,7 @@ def run_inference(
     progress=gr.Progress()
 ):
     global pipeline, loaded_ckpt_dir, loaded_wav2vec_dir, loaded_model_type
+    global global_sample_rate, global_slice_len_samples
 
     # 1. Load Model if needed
     if pipeline is None or loaded_ckpt_dir != ckpt_dir or loaded_wav2vec_dir != wav2vec_dir or loaded_model_type != model_type:
@@ -218,6 +257,8 @@ def run_inference(
 
     human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
     
+    global_sample_rate = sample_rate
+    global_slice_len_samples = human_speech_array_slice_len
     output_dir = 'gradio_results_live'
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
@@ -230,8 +271,6 @@ def run_inference(
     )
 
     playlist_yielded = False
-    current_audio_sample_idx = 0
-
     cached_audio_length_sum = sample_rate * cached_audio_duration
     audio_end_idx = cached_audio_duration * tgt_fps
     audio_start_idx = audio_end_idx - frame_num
@@ -240,38 +279,58 @@ def run_inference(
     # 用静音填充音频末尾，防止最后的分块被截断
     remainder = len(human_speech_array_all) % human_speech_array_slice_len
     if remainder > 0:
-        human_speech_array_all = np.concatenate([human_speech_array_all, np.zeros(human_speech_array_slice_len - remainder, dtype=human_speech_array_all.dtype)])
-
+        human_speech_array_all = np.concatenate([
+            human_speech_array_all, 
+            np.zeros(human_speech_array_slice_len - remainder, dtype=human_speech_array_all.dtype)
+        ])
     human_speech_array_slices = human_speech_array_all.reshape(-1, human_speech_array_slice_len)
 
+    # 1. 启动前清空残留队列
+    while not live_audio_queue.empty():
+        try: live_audio_queue.get_nowait()
+        except queue.Empty: break
+
+    # 2. 将初始音频放入队列
+    for chunk in human_speech_array_slices:
+        live_audio_queue.put(chunk)
+
+    # 3. 准备一段标准静音数据用于填充无音频的时刻
+    silent_speech_array = np.zeros(human_speech_array_slice_len, dtype=np.float32)
+
+    # --- 【新增】时间轴对齐参数 ---
+    stream_start_time = time.time()
+    chunk_duration = human_speech_array_slice_len / sample_rate
+    MAX_AHEAD_SECONDS = 2.5  # 限制 GPU 最多只能超前生成 2.5 秒的缓冲，保证插播极速响应
+
     try:
-        total_chunks = len(human_speech_array_slices)
-        for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
-            # progress(0.2 + 0.7 * (chunk_idx / total_chunks), desc=f"Streaming Chunk {chunk_idx+1}/{total_chunks}...")
+        chunk_idx = 0
+        while True:
+            # 尝试从队列拿音频，拿不到就用静音
+            try:
+                current_speech_array = live_audio_queue.get_nowait()
+                is_silent_mode = False
+            except queue.Empty:
+                current_speech_array = silent_speech_array
+                is_silent_mode = True
 
             # --- AI 推理 ---
-            audio_dq.extend(human_speech_array.tolist())
+            audio_dq.extend(current_speech_array.tolist())
             audio_array = np.array(audio_dq)
+            
             audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
-
             video = run_pipeline(pipeline, audio_embedding)
             video = video[motion_frames_num:] # 截取有效动作帧 (通常是 24 帧)
 
-            # --- 转换裸数据 ---
-            # 转成 uint8 numpy 矩阵送给管道 (Shape: [Frames, H, W, 3])
+            # --- 转换并推流 ---
             video_np = video.cpu().numpy().astype(np.uint8)
-            frames_in_chunk = video_np.shape[0]
-            samples_in_chunk = int((frames_in_chunk / tgt_fps) * sample_rate)
+            live_pipeline.push_data(video_np, current_speech_array)
 
-            # 提取完全对应的音频段落
-            audio_fragment = human_speech_array_all[current_audio_sample_idx : current_audio_sample_idx + samples_in_chunk]
-            current_audio_sample_idx += samples_in_chunk
+            if is_silent_mode:
+                logger.info(f"Idle Streaming... chunk_idx: {chunk_idx}")
+            else:
+                logger.info(f"Speech Streaming... chunk_idx: {chunk_idx} (Queue size: {live_audio_queue.qsize()})")
 
-            # --- 灌入管道！---
-            live_pipeline.push_data(video_np, audio_fragment)
-            logger.info(f"chunk_idx: {chunk_idx} frames_in_chunk:{frames_in_chunk} samples_in_chunk:{samples_in_chunk}")
             # --- 唤醒前端 ---
-            # 只要管道生成了 m3u8，且尚未发送给前端，就发送一次
             if not playlist_yielded and os.path.exists(live_pipeline.playlist_path):
                 logger.info(f"Live Playlist generated: {live_pipeline.playlist_path}")
 
@@ -332,6 +391,23 @@ def run_inference(
                     download_output: gr.update(visible=False)
                 }
                 playlist_yielded = True
+            else:
+                # 配合 Gradio 机制进行跳过更新，以持续监听中止事件
+                yield {
+                    html_output: gr.skip(),
+                    download_output: gr.skip()
+                }
+
+            # --- 【核心新增】防过度生成限速锁 ---
+            generated_time = (chunk_idx + 1) * chunk_duration
+            real_elapsed_time = time.time() - stream_start_time
+            
+            ahead_time = generated_time - real_elapsed_time
+            # 如果 GPU 生成的视频时间比现实时间超前了 0.5 秒以上，强制挂起等待
+            if ahead_time > MAX_AHEAD_SECONDS:
+                time.sleep(ahead_time - MAX_AHEAD_SECONDS)
+
+            chunk_idx += 1
 
     finally:
         # 当音频播放完毕，关闭流并安全释放 FFmpeg 进程
@@ -355,13 +431,20 @@ with gr.Blocks(title="SoulX-FlashHead Live Pipeline", theme=gr.themes.Soft()) as
                         height=300
                     )
                     audio_path_input = gr.Audio(
-                        label="Audio Input", 
+                        label="Audio Input (Start / Insert)", 
                         type="filepath", 
                         value="examples/podcast_sichuan_16k.wav"
                     )
 
             generate_btn = gr.Button("🚀 Start Live Stream", variant="primary", size="lg")
             stop_btn = gr.Button("🛑 Stop Broadcast", variant="stop", size="lg")
+
+            # --- 【精简版】插播控制台 ---
+            with gr.Group():
+                gr.Markdown("### 🎤 Live Interaction")
+                gr.Markdown("直播中想换词？直接在上方 **Audio Input** 清空并上传新音频，然后点击下方按钮插播！")
+                insert_btn = gr.Button("⚡ Insert Current Audio into Stream")
+                insert_status = gr.Textbox(label="Status", interactive=False)
 
             with gr.Accordion("⚙️ Advanced Settings & Model Configuration", open=False):
                 with gr.Tabs():
@@ -397,12 +480,7 @@ with gr.Blocks(title="SoulX-FlashHead Live Pipeline", theme=gr.themes.Soft()) as
                 label="Live Stream Viewer", 
                 value="<div style='width: 100%; height: 500px; background: black; display: flex; align-items: center; justify-content: center; color: white;'>Waiting for live stream to start...</div>"
             )
-            # video_output = gr.Video(
-            #     label="Live Stream Viewer", 
-            #     height=500,
-            #     autoplay=True,
-            #     interactive=False
-            # )
+
             download_output = gr.File(
                 label="📥 Download Component (Hidden)", 
                 visible=False
@@ -424,6 +502,13 @@ with gr.Blocks(title="SoulX-FlashHead Live Pipeline", theme=gr.themes.Soft()) as
     )
 
     stop_btn.click(fn=None, inputs=None, outputs=None, cancels=[stream_event])
+
+    # --- 【修改这里】直接提取 audio_path_input 里的新文件 ---
+    insert_btn.click(
+        fn=insert_dynamic_audio,
+        inputs=[audio_path_input],  # <--- 直接复用它！
+        outputs=[insert_status]
+    )
 
 if __name__ == "__main__":
     import uvicorn
