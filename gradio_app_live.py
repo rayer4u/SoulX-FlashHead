@@ -352,11 +352,13 @@ def run_inference(
 
                         if (Hls.isSupported()) {{
                             var hls = new Hls({{
-                                maxBufferLength: 30,         // 允许在内存里最大缓冲 30 秒
-                                liveSyncDurationCount: 3,
-                                // liveMaxLatencyDurationCount: 6,
-                                maxLiveSyncPlaybackRate: 1,
-                                debug: true,
+                                maxBufferLength: 3,         // 允许在内存里最大缓冲 3 秒
+                                liveSyncDurationCount: 1,
+                                liveMaxLatencyDurationCount: 2,
+                                maxLiveSyncPlaybackRate: 1.5,
+                                enableWorker: true,
+                                lowLatencyMode: true,
+                                debug: false,
                             }});
                             hls.loadSource(url);
                             hls.attachMedia(video);
